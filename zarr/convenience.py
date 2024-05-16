@@ -3,6 +3,7 @@
 import itertools
 import os
 import re
+import numpy as np
 from collections.abc import Mapping, MutableMapping
 
 from zarr._storage.store import data_root, meta_root, assert_zarr_v3_api_available
@@ -39,7 +40,7 @@ def _check_and_update_path(store: BaseStore, path):
 
 
 # noinspection PyShadowingBuiltins
-def open(store: StoreLike = None, mode: str = "a", *, zarr_version=None, path=None, **kwargs):
+def open(store: StoreLike = None, mode: str = "a", *, zarr_version=None, path=None, apply_scaling: bool = True, **kwargs):
     """Convenience function to open a group or array using file-mode-like semantics.
 
     Parameters
@@ -62,6 +63,8 @@ def open(store: StoreLike = None, mode: str = "a", *, zarr_version=None, path=No
 
     path : str or None, optional
         The path within the store to open.
+    apply_scaling : bool, optional
+        Whether to apply scaling based on the "scaling-metadata" attribute. Defaults to True.
     **kwargs
         Additional parameters are passed through to :func:`zarr.creation.open_array` or
         :func:`zarr.hierarchy.open_group`.
@@ -103,18 +106,29 @@ def open(store: StoreLike = None, mode: str = "a", *, zarr_version=None, path=No
 
     """
 
+    import zarr
+    import numpy as np
+
     # handle polymorphic store arg
-    # we pass storage options explicitly, since normalize_store_arg might construct
-    # a store if the input is a fsspec-compatible URL
     _store: BaseStore = normalize_store_arg(
         store,
         storage_options=kwargs.pop("storage_options", {}),
         mode=mode,
         zarr_version=zarr_version,
     )
-    # path = _check_and_update_path(_store, path)
     path = normalize_storage_path(path)
     kwargs["path"] = path
+
+    def _process_group(group):
+        scaling_metadata = group.attrs.get("scaling-metadata")
+        if apply_scaling and scaling_metadata is not None:
+            new_group = zarr.group()
+            for key in group:
+                original_array = group[key][:]
+                scaled_array = original_array / scaling_metadata
+                new_group.array(key, scaled_array, dtype=np.float64)  # Ensuring floating-point dtype
+            return new_group
+        return group
 
     if mode in {"w", "w-", "x"}:
         if "shape" in kwargs:
@@ -126,13 +140,15 @@ def open(store: StoreLike = None, mode: str = "a", *, zarr_version=None, path=No
         if "shape" in kwargs or contains_array(_store, path):
             return open_array(_store, mode=mode, **kwargs)
         else:
-            return open_group(_store, mode=mode, **kwargs)
+            group = open_group(_store, mode=mode, **kwargs)
+            return _process_group(group)
 
     else:
         if contains_array(_store, path):
             return open_array(_store, mode=mode, **kwargs)
         elif contains_group(_store, path):
-            return open_group(_store, mode=mode, **kwargs)
+            group = open_group(_store, mode=mode, **kwargs)
+            return _process_group(group)
         else:
             raise PathNotFoundError(path)
 
